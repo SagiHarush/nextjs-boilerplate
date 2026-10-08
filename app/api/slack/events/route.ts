@@ -7,13 +7,15 @@ function verifySlackSignature(
   timestamp: string,
   signature: string
 ) {
-  const signingSecret = process.env.SLACK_SIGNING_SECRET!;
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
 
-  // Reject replayed requests older than 5 minutes
+  if (!signingSecret) return false;
+
   const age = Math.abs(Date.now() / 1000 - Number(timestamp));
   if (age > 60 * 5) return false;
 
   const base = `v0:${timestamp}:${rawBody}`;
+
   const expected =
     "v0=" +
     crypto
@@ -21,10 +23,14 @@ function verifySlackSignature(
       .update(base)
       .digest("hex");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(expected),
-    Buffer.from(signature)
-  );
+  const expectedBuffer = Buffer.from(expected);
+  const signatureBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== signatureBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
 async function slackGet(method: string, params: Record<string, string>) {
@@ -46,6 +52,24 @@ async function slackGet(method: string, params: Record<string, string>) {
 export async function POST(req: Request) {
   const rawBody = await req.text();
 
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  // Slack URL verification — do this first
+  if (body.type === "url_verification") {
+    return new Response(body.challenge, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/plain",
+      },
+    });
+  }
+
+  // Verify all real Slack events
   const timestamp = req.headers.get("x-slack-request-timestamp") ?? "";
   const signature = req.headers.get("x-slack-signature") ?? "";
 
@@ -55,13 +79,6 @@ export async function POST(req: Request) {
     !verifySlackSignature(rawBody, timestamp, signature)
   ) {
     return new Response("Invalid Slack signature", { status: 401 });
-  }
-
-  const body = JSON.parse(rawBody);
-
-  // Slack URL verification
-  if (body.type === "url_verification") {
-    return Response.json({ challenge: body.challenge });
   }
 
   if (body.type !== "event_callback") {
